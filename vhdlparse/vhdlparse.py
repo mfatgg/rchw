@@ -2,6 +2,7 @@
 
 # vhdlparse.py - Attempt at a simple (pragmatic) VHDL parser
 # 2011, 2012 Oswald Berthold
+# 2012, 2013 mfatgg
 # GPL
 
 # Manifest:
@@ -73,49 +74,65 @@ def parse_hdl(vhdstring):
     ident = Word(alphas, alphanums + "_")
     ent_ident = ident.setResultsName("ENT_NAME")
     number = Word(nums + ".")
+    truefalse = oneOf("true false")
     paren = oneOf("( )")
     oper = oneOf("* + - /")
-    punctuation = oneOf("; :")
     direction = oneOf("in out inout")
     vecspec = oneOf("downto upto to")
-    wildToken = Word(alphas, alphanums + "_-", punctuation, paren)
+    wildToken = Word(alphas, alphanums + "_")
     assignToken = Keyword("<=")
     definitionToken = Keyword(":=")
-    numberOper = number | (paren + number + oper + ident + paren + oper + number)
-    # assignrhs = (ident | (ident + paren + number + paren) | (ident + paren + number + vecspec + number + paren))
-    assignrhs = ident + Optional(paren + number + Optional(vecspec + number) + paren)
-    assignment = Group(assignrhs + assignToken + SkipTo(punctuation) + punctuation)
+    numberOper = (ident+ZeroOrMore("'length") | number) + ZeroOrMore(oper + (ident+ZeroOrMore("'length") | number))
+    aggregateTypeDef = "(" + numberOper + Optional(vecspec + numberOper) + ")"
+    assignTypeDef = ident + Optional(aggregateTypeDef) + ZeroOrMore("." + ident + Optional(aggregateTypeDef))
+    definition_rhs = (numberOper | truefalse | "\'" + oneOf("0 1 Z") + "\'" | "\"" + Word("01Z") + "\"")
 
-    portType = oneOf("unsigned signed std_logic_vector std_logic integer", caseless=True)
-    portAggregateTypeDef = paren + \
-                           numberOper + \
-                           vecspec + \
-                           Word(nums) + \
-                           paren
-    portTypeFull = portType + Optional(portAggregateTypeDef)
+    assignment = Group(assignTypeDef + assignToken + SkipTo(";") + ";")
+    definition = definitionToken + definition_rhs
+
+    portType = oneOf("unsigned signed std_logic_vector std_logic integer boolean", caseless=True)
+    portTypeFull = portType + Optional(aggregateTypeDef) + Optional(definition)
     # generics
     rangeToken = Keyword("range", caseless=True)
     genericRange = rangeToken + number + vecspec + number
-    genericLine = Group(ident + punctuation + portType + Optional(genericRange) + definitionToken + number + Optional(punctuation))
+    genericLine = Group(ident + ":" + portType + Optional(genericRange) + definition + Optional(";"))
     genericSpec = ZeroOrMore(genericLine)
-    generics = genericToken + paren + genericSpec + paren + punctuation
-    
+    generics = genericToken + "(" + genericSpec + ");"
+
     # number = nums
-    portLine = Group(ident + punctuation + direction + portTypeFull + Optional(punctuation))
+    portLine = Group(ident + ":" + direction + portTypeFull + Optional(";"))
     portSpec = ZeroOrMore(portLine).setResultsName("PORTSPEC")
 
     # processes
     procToken = Keyword("process", caseless=True)
-    procBeginToken = Optional(ident + punctuation) + procToken + SkipTo(beginToken) + beginToken
-    procEndToken = endToken + procToken + Optional(ident) + punctuation
-    process = Group(procBeginToken + SkipTo(procEndToken) + procEndToken)
+    procBeginToken = Optional(ident + ":") + procToken + SkipTo(beginToken, ignore="--"+restOfLine) + beginToken
+    procEndToken = endToken + procToken + Optional(ident) + ";"
+    process = Group(procBeginToken + SkipTo(procEndToken, ignore="--"+restOfLine) + procEndToken)
 
     # instances
-    genericMap = genericToken + mapToken + paren + SkipTo(paren) + paren
-    instBeginToken = ident + punctuation + ident + Optional(genericMap) + portToken + mapToken + \
-                     paren
-    instEndToken = paren + punctuation
-    instToken = Group(instBeginToken + SkipTo(instEndToken) + instEndToken)
+    genericMap = genericToken + mapToken + "(" + SkipTo(")", ignore="--"+restOfLine) + ")"
+    instBeginToken = ident + ":" + ident + Optional(genericMap) + portToken + mapToken + "("
+    instEndToken = ");"
+    instance = Group(instBeginToken + SkipTo(instEndToken, ignore="--"+restOfLine) + instEndToken)
+    # ZeroOrMore(ident + Optional("(" + number + Optional(vecspec + number) + ")") +
+    # "=>" +
+    # (ident + Optional("(" + number + Optional(vecspec + number) + ")")|"'" + Word("01Z") + "'") + Optional(","))
+
+    # generate
+    forToken = Keyword("for", caseless=True)
+    inToken = Keyword("in", caseless=True)
+    ifToken = Keyword("if", caseless=True)
+    forStatement = forToken + ident + inToken + ((numberOper + vecspec + numberOper)|ident + "'range")
+    comparison = (number | ident) + oneOf("= /= <= >=") + (number | ident)
+    ifStatement = ifToken + comparison + ZeroOrMore(oneOf("or and") + comparison)
+    generateToken = Keyword("generate", caseless=True)
+    generateBeginToken = Optional(ident + ":") + (forStatement | ifStatement) + \
+                         generateToken + Optional(beginToken)
+    generateEndToken = endToken + generateToken + Optional(ident) + ";"
+    # nested generates: (3 layers for now)
+    generate0 = generateBeginToken + ZeroOrMore(process|assignment|instance) + generateEndToken
+    generate1 = generateBeginToken + ZeroOrMore(generate0|process|assignment|instance) + generateEndToken
+    generate2 = generateBeginToken + ZeroOrMore(generate1|process|assignment|instance) + generateEndToken
 
     # architecture
     archToken = Keyword("architecture", caseless=True).setResultsName("ARCH")
@@ -123,17 +140,17 @@ def parse_hdl(vhdstring):
     archAffiliation = oneOf("of is")
     archEntity = ident
     archHeader = SkipTo(beginToken) # ZeroOrMore(wildToken)
-    archBodyElems = ZeroOrMore(process|assignment|instToken).setResultsName("ARCH_BODY_ELEM")
+    archBodyElems = ZeroOrMore(generate2|process|assignment|instance).setResultsName("ARCH_BODY_ELEM")
     archBody = beginToken + \
                archBodyElems + \
-               endToken + Optional(Optional(archToken) + ident) + punctuation # ZeroOrMore(wildToken)
-    
+               endToken + Optional(Optional(archToken) + ident) + ";" # ZeroOrMore(wildToken)
+
     # HDL_ent = Literal("entity") +
     # instantiate parser
     HDL_ent = entityToken + ent_ident + Literal("is") + \
               Optional(generics) + \
-              portToken + paren + portSpec + paren + punctuation + \
-              endToken + Optional(entityToken) + ident + punctuation
+              portToken + "(" + portSpec + ");" + \
+              endToken + Optional(entityToken) + ident + ";"
 
     HDL_arch = (archToken + archIdent + archAffiliation + \
                archEntity + archAffiliation + archHeader + \
@@ -593,7 +610,7 @@ def write_hdl_graph_ext(hdlfile, parseres):
                     except:
                         # print "no such element"
                         pass
-                
+
 
                     # check assignment rhs
                     i = 0
@@ -686,7 +703,7 @@ def write_hdl_graph_ext(hdlfile, parseres):
         # # out-out?
         # # assign-in?
         # # out-assign
-        
+
     # processes
 
     # internal wiring
@@ -768,12 +785,13 @@ def write_hdl_graph_ext(hdlfile, parseres):
     #  - architecture, signals, component instances, processes
     #  - signal assignments
     # FIXME: detail recursion
-    
+
     s = Template(graph_template_s)
     graph_template = s.substitute(template_dict)
     f = open(vhdfile_graph, "w")
     f.write(graph_template)
     f.close()
+
 
 # greet = Word( alphas ) + "," + Word( alphas ) + "!"
 # hello = "blub Hello, World!"
